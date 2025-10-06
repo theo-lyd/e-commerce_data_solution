@@ -26,6 +26,7 @@ jobs:
         run: python scripts/etl_pipeline.py
 
       - name: Upload Data Warehouse Artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: olist-data-warehouse
