@@ -1,10 +1,18 @@
 import sys
+import os
 import great_expectations as ge
+
+# Get the project root directory
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# Define the path to the Great Expectations context root
+GE_CONTEXT_ROOT = os.path.join(PROJECT_ROOT, 'great_expectations')
 
 def run_validation(checkpoint_name: str) -> bool:
     """Runs a Great Expectations checkpoint."""
     print(f"Running Great Expectations checkpoint: {checkpoint_name}")
-    context = ge.get_context()
+    # Get the context from the explicit root directory
+    context = ge.get_context(context_root_dir=GE_CONTEXT_ROOT)
 
     result = context.run_checkpoint(checkpoint_name=checkpoint_name)
 

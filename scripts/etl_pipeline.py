@@ -4,11 +4,19 @@ import json
 import shutil
 import subprocess
 
-# Define file paths
-DATA_DIR = '../data'
-OUTPUT_DIR = '../output'
+# Get the directory of the currently running script
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# Go one level up to get the project root
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
+
+# Define all other paths relative to the project root
+DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output')
 TEMP_DIR = os.path.join(OUTPUT_DIR, '_tmp')
 WATERMARK_FILE = os.path.join(OUTPUT_DIR, '_watermark.json')
+VALIDATION_SCRIPT_PATH = os.path.join(PROJECT_ROOT, 'scripts', 'validate_data.py')
+
 
 def extract_data():
     """Reads all CSV files from the data directory into a dictionary of DataFrames."""
