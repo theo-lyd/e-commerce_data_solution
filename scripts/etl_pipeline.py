@@ -4,17 +4,14 @@ import json
 import shutil
 import subprocess
 
+# --- ROBUST PATH DEFINITION ---
 # Get the directory of the currently running script
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-
 # Go one level up to get the project root
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
-
 # Define all other paths relative to the project root
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output')
-TEMP_DIR = os.path.join(OUTPUT_DIR, '_tmp')
-WATERMARK_FILE = os.path.join(OUTPUT_DIR, '_watermark.json')
 VALIDATION_SCRIPT_PATH = os.path.join(PROJECT_ROOT, 'scripts', 'validate_data.py')
 
 
@@ -26,150 +23,106 @@ def extract_data():
     all_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
     dataframes = {}
     for file in all_files:
-        table_name = file.replace('olist_', '').replace('_dataset.csv', '').replace('.csv', '')
+        clean_name = file.replace('olist_', '').replace('_dataset.csv', '').replace('.csv', '')
+        if 'product_category_name_translation' in clean_name:
+            clean_name = 'product_category_name_translation'
         file_path = os.path.join(DATA_DIR, file)
-        dataframes[table_name] = pd.read_csv(file_path)
-        print(f"  - Loaded {table_name} with {len(dataframes[table_name])} rows.")
+        dataframes[clean_name] = pd.read_csv(file_path)
+        print(f"  - Loaded {clean_name} with {len(dataframes[clean_name])} rows.")
 
     print("Data extraction complete.")
     return dataframes
 
-def transform_data(dataframes):
-    """Cleans, merges, and engineers features from the extracted data."""
-    print("Starting data transformation...")
-    
-    # In the transform_data function:
-    if not dataframes:
-        print("No dataframes to transform. Aborting.")
-        return None
+def transform_and_create_schema(dataframes):
+    """Transforms raw data into a clean star schema model."""
+    print("Transforming data into a star schema...")
 
-    # 1. Cleaning: Convert date columns to datetime objects
+    # --- Data Cleaning and Preparation ---
+    # Convert date columns across all tables
     for df_name, df in dataframes.items():
         for col in df.columns:
             if 'timestamp' in col or '_date' in col:
                 dataframes[df_name][col] = pd.to_datetime(df[col], errors='coerce')
 
-    print("  - Converted date columns to datetime.")
+    # --- Create Dimension Tables ---
 
-    # 2. Joining (Merging) DataFrames based on the schema
-    # Start with orders as the central table
-    df = dataframes['orders'].copy()
+    # 1. dim_customers
+    dim_customers = dataframes['customers'].drop_duplicates(subset=['customer_id']).copy()
+    print(f"  - Created dim_customers with {len(dim_customers)} unique customers.")
 
-    # Merge other tables
-    df = pd.merge(df, dataframes['order_payments'], on='order_id', how='left')
-    df = pd.merge(df, dataframes['order_reviews'], on='order_id', how='left')
-    df = pd.merge(df, dataframes['customers'], on='customer_id', how='left')
+    # 2. dim_products
+    products = dataframes['products'].copy()
+    translations = dataframes['product_category_name_translation'].copy()
+    dim_products = pd.merge(products, translations, on='product_category_name', how='left')
+    dim_products = dim_products.drop_duplicates(subset=['product_id'])
+    print(f"  - Created dim_products with {len(dim_products)} unique products.")
 
-    # Order items needs to be joined with products and sellers first
-    order_items = dataframes['order_items'].copy()
-    order_items = pd.merge(order_items, dataframes['products'], on='product_id', how='left')
-    order_items = pd.merge(order_items, dataframes['sellers'], on='seller_id', how='left')
+    # 3. dim_sellers
+    dim_sellers = dataframes['sellers'].drop_duplicates(subset=['seller_id']).copy()
+    print(f"  - Created dim_sellers with {len(dim_sellers)} unique sellers.")
 
-    # Now merge the enriched order_items table
-    df = pd.merge(df, order_items, on='order_id', how='left')
+    # --- Create the Fact Table ---
+    # Start with order_items as the base for the fact table, as it has the core transaction data
+    fact_orders = dataframes['order_items'].copy()
 
-    # Finally, merge the category name translation
-    df = pd.merge(df, dataframes['product_category_name_translation'], on='product_category_name', how='left')
+    # Join with orders to get customer_id and order date information
+    orders = dataframes['orders'][['order_id', 'customer_id', 'order_status', 'order_purchase_timestamp', 'order_delivered_customer_date', 'order_estimated_delivery_date']]
+    fact_orders = pd.merge(fact_orders, orders, on='order_id', how='left')
 
-    print(f"  - Merged all dataframes into a single table with {len(df)} rows.")
+    # Join with order_payments to get payment info
+    payments = dataframes['order_payments'].groupby('order_id').agg(
+        payment_sequential=('payment_sequential', 'max'),
+        payment_installments=('payment_installments', 'sum'),
+        payment_value=('payment_value', 'sum')
+    ).reset_index()
+    fact_orders = pd.merge(fact_orders, payments, on='order_id', how='left')
 
-    print("  - Re-asserting datetime types after merges...")
-    date_cols_for_calc = [
-        'order_purchase_timestamp',
-        'order_delivered_customer_date',
-        'order_estimated_delivery_date',
-        'order_delivered_carrier_date',
-        'order_approved_at'
-    ]
-    for col in date_cols_for_calc:
-        df[col] = pd.to_datetime(df[col], errors='coerce')
-
-    # 3. Feature Engineering
-    # Calculate delivery time in days
-    df['delivery_time_days'] = (df['order_delivered_customer_date'] - df['order_purchase_timestamp']).dt.total_seconds() / (24 * 60 * 60)
-
-    # Flag for late deliveries
-    df['is_late'] = df['order_delivered_customer_date'] > df['order_estimated_delivery_date']
-
-    # Calculate seller handling time in days
-    df['seller_handling_time_days'] = (df['order_delivered_carrier_date'] - df['order_approved_at']).dt.total_seconds() / (24 * 60 * 60)
-
-    # Calculate freight ratio
-    df['freight_ratio'] = df['freight_value'] / df['price']
-
-    print("  - Engineered new features: delivery_time_days, is_late, seller_handling_time_days, freight_ratio.")
-
-    print("Data transformation complete.")
-    return df
-
-def load_data(df):
-    """Saves the transformed DataFrame as a partitioned Parquet file idempotently."""
-    print("Starting data loading...")
+    # Join with order_reviews to get review scores
+    reviews = dataframes['order_reviews'][['order_id', 'review_score']].groupby('order_id').agg(review_score=('review_score', 'mean')).reset_index()
+    fact_orders = pd.merge(fact_orders, reviews, on='order_id', how='left')
     
-    # In the load_data function:
-    if df is None or df.empty:
-        print("No data to load. Aborting.")
-        return
+    print(f"  - Created fact_orders with {len(fact_orders)} line items.")
 
-    # Ensure the temporary directory exists and is empty
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    os.makedirs(TEMP_DIR)
+    return {
+        "fact_orders": fact_orders,
+        "dim_customers": dim_customers,
+        "dim_products": dim_products,
+        "dim_sellers": dim_sellers
+    }
 
-    # Add year and month columns for partitioning
-    df['year'] = df['order_purchase_timestamp'].dt.year
-    df['month'] = df['order_purchase_timestamp'].dt.month
+def load_schema_tables(schema_tables):
+    """Saves each table in the star schema as a separate Parquet file."""
+    print("Loading schema tables to Parquet files...")
+    # Clear the output directory for a clean load
+    if os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR)
 
-    # Save to temporary partitioned Parquet files
-    df.to_parquet(
-        TEMP_DIR,
-        partition_cols=['year', 'month'],
-        engine='pyarrow',
-        compression='snappy'
-    )
-    print(f"  - Saved data temporarily to {TEMP_DIR}")
-
-    # Atomic move: remove old data and replace with new
-    final_output_path = os.path.join(OUTPUT_DIR, 'olist_master.parquet')
-    if os.path.exists(final_output_path):
-        shutil.rmtree(final_output_path)
-
-    os.rename(TEMP_DIR, final_output_path)
-    print(f"  - Atomically moved data to {final_output_path}")
-
-    # Update watermark
-    last_processed_date = df['order_purchase_timestamp'].max().isoformat()
-    with open(WATERMARK_FILE, 'w') as f:
-        json.dump({'last_processed_date': last_processed_date}, f)
-
-    print(f"  - Updated watermark with last date: {last_processed_date}")
+    for name, df in schema_tables.items():
+        file_path = os.path.join(OUTPUT_DIR, f'{name}.parquet')
+        df.to_parquet(file_path, index=False)
+        print(f"  - Saved {name} to {file_path}")
     print("Data loading complete.")
 
 def main():
     """Main function to orchestrate the ETL process."""
     print("ETL process started.")
-
-    # Step 1: Extract
     extracted_data = extract_data()
 
-    # New Step: Validate Source Data
+    # The validation step can remain the same as it checks the raw source data
     print("Validating source data...")
     validation_process = subprocess.run(
-        ["python", "validate_data.py", "validate_orders_checkpoint"], # Use the correct checkpoint name
+        ["python", VALIDATION_SCRIPT_PATH, "validate_orders_checkpoint"],
         capture_output=True, text=True
     )
     print(validation_process.stdout)
     if validation_process.returncode != 0:
         print("Source data validation failed. Aborting ETL process.")
         print(validation_process.stderr)
-        return # Stop the pipeline
+        return
 
-    # Step 2: Transform
-    transformed_df = transform_data(extracted_data)
-
-    # Step 3: Load
-    load_data(transformed_df)
-
+    schema_tables = transform_and_create_schema(extracted_data)
+    load_schema_tables(schema_tables)
     print("ETL process completed successfully.")
 
 if __name__ == "__main__":
