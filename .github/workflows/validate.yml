@@ -11,6 +11,11 @@ on:
 jobs:
   build-and-validate:
     runs-on: ubuntu-latest
+    
+    # Key Fix: Set a default working directory for all run commands in this job
+    defaults:
+      run:
+        working-directory: ./
 
     steps:
       - name: Check out repository
@@ -30,17 +35,16 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
+        # This command will now correctly find requirements.txt at the root
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run ETL & Data Quality Pipeline
-        # This is the key change: we set a working directory for the command
-        working-directory: ./scripts
-        run: python etl_pipeline.py
+        # This command will also run from the root, so script paths must be full
+        run: python scripts/etl_pipeline.py
 
       - name: Upload Data Warehouse Artifact
-        # This step runs only if the previous steps succeed
         uses: actions/upload-artifact@v3
         with:
           name: olist-data-warehouse
