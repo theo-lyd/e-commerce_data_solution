@@ -1,0 +1,60 @@
+# Name for the GitHub Actions workflow
+name: Data Pipeline Validation
+
+# 1. Define the triggers for this workflow
+on:
+  # Run on every push to the main branch
+  push:
+    branches:
+      - main
+  # Run on every pull request that targets the main branch
+  pull_request:
+    branches:
+      - main
+
+# Define the jobs that will run in this workflow
+jobs:
+  build-and-validate:
+    # Use the latest Ubuntu runner environment
+    runs-on: ubuntu-latest
+
+    # 2. Define the sequence of steps for the job
+    steps:
+      # Step 2.1: Check out the repository's code
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      # Step 2.2: Set up the Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10' # Specify a stable Python version
+
+      # Step 2.3: Cache dependencies for faster builds
+      - name: Cache Pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip # The directory to cache
+          # Create a unique key for the cache based on the runner OS and requirements.txt hash
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # Step 2.4: Install Python dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 2.5: Run the ETL and Data Quality Pipeline
+      # This is the main step. If this script fails, the workflow will fail.
+      - name: Run ETL & Data Quality Pipeline
+        run: python scripts/etl_pipeline.py
+
+      # Step 2.6: Upload the Data Warehouse as an Artifact
+      # This step runs only if the previous steps succeed.
+      - name: Upload Data Warehouse Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: olist-data-warehouse # Name of the artifact in GitHub
+          path: output/olist_master.parquet # Path to the directory to upload
