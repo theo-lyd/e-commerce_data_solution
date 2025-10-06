@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import json
 import shutil
+import subprocess
 
 # Define file paths
 DATA_DIR = '../data'
@@ -142,6 +143,18 @@ def main():
 
     # Step 1: Extract
     extracted_data = extract_data()
+
+    # New Step: Validate Source Data
+    print("Validating source data...")
+    validation_process = subprocess.run(
+        ["python", "validate_data.py", "validate_orders_checkpoint"], # Use the correct checkpoint name
+        capture_output=True, text=True
+    )
+    print(validation_process.stdout)
+    if validation_process.returncode != 0:
+        print("Source data validation failed. Aborting ETL process.")
+        print(validation_process.stderr)
+        return # Stop the pipeline
 
     # Step 2: Transform
     transformed_df = transform_data(extracted_data)
