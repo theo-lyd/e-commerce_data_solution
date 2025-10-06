@@ -1,5 +1,7 @@
 import os
 import pandas as pd
+import numpy as np
+from collections import Counter
 import json
 import shutil
 import subprocess
@@ -14,6 +16,15 @@ DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output')
 VALIDATION_SCRIPT_PATH = os.path.join(PROJECT_ROOT, 'scripts', 'validate_data.py')
 
+
+def _mode_or_first(series):
+    # safe mode: return most common value; if tie or all nan, return first non-null
+    vals = series.dropna().tolist()
+    if not vals:
+        return np.nan
+    counts = Counter(vals)
+    mode_val, cnt = counts.most_common(1)[0]
+    return mode_val
 
 def extract_data():
     """Reads all CSV files from the data directory into a dictionary of DataFrames."""
@@ -34,11 +45,10 @@ def extract_data():
     return dataframes
 
 def transform_and_create_schema(dataframes):
-    """Transforms raw data into a clean star schema model."""
+    """Transforms raw data into a clean star schema model and preserves payments & reviews dims."""
     print("Transforming data into a star schema...")
 
-    # --- Data Cleaning and Preparation ---
-    # Convert date columns across all tables
+    # Convert date columns across all tables (if not already done upstream)
     for df_name, df in dataframes.items():
         for col in df.columns:
             if 'timestamp' in col or '_date' in col:
@@ -50,10 +60,13 @@ def transform_and_create_schema(dataframes):
     dim_customers = dataframes['customers'].drop_duplicates(subset=['customer_id']).copy()
     print(f"  - Created dim_customers with {len(dim_customers)} unique customers.")
 
-    # 2. dim_products
+    # 2. dim_products (include translated category)
     products = dataframes['products'].copy()
-    translations = dataframes['product_category_name_translation'].copy()
-    dim_products = pd.merge(products, translations, on='product_category_name', how='left')
+    translations = dataframes.get('product_category_name_translation', pd.DataFrame())
+    if not translations.empty:
+        dim_products = pd.merge(products, translations, on='product_category_name', how='left')
+    else:
+        dim_products = products.copy()
     dim_products = dim_products.drop_duplicates(subset=['product_id'])
     print(f"  - Created dim_products with {len(dim_products)} unique products.")
 
@@ -61,34 +74,116 @@ def transform_and_create_schema(dataframes):
     dim_sellers = dataframes['sellers'].drop_duplicates(subset=['seller_id']).copy()
     print(f"  - Created dim_sellers with {len(dim_sellers)} unique sellers.")
 
-    # --- Create the Fact Table ---
-    # Start with order_items as the base for the fact table, as it has the core transaction data
-    fact_orders = dataframes['order_items'].copy()
+    # 4. dim_payments: payment-level table (one row per payment event)
+    if 'order_payments' in dataframes:
+        dp = dataframes['order_payments'].copy()
+        # ensure types
+        if 'payment_installments' in dp.columns:
+            dp['payment_installments'] = pd.to_numeric(dp['payment_installments'], errors='coerce').fillna(0).astype(int)
+        dp['payment_value'] = pd.to_numeric(dp['payment_value'], errors='coerce').fillna(0.0)
+        # keep raw payments as dim_payments
+        dim_payments = dp.drop_duplicates().reset_index(drop=True)
+        print(f"  - Created dim_payments with {len(dim_payments)} payment events.")
+    else:
+        dim_payments = pd.DataFrame(columns=['order_id','payment_sequential','payment_type','payment_installments','payment_value'])
+        print("  - order_payments not found; dim_payments empty.")
 
-    # Join with orders to get customer_id and order date information
-    orders = dataframes['orders'][['order_id', 'customer_id', 'order_status', 'order_purchase_timestamp', 'order_delivered_customer_date', 'order_estimated_delivery_date']]
+    # 5. dim_reviews: review-level records (text + dates)
+    if 'order_reviews' in dataframes:
+        dr = dataframes['order_reviews'].copy()
+        # standardize date
+        for c in ['review_creation_date', 'review_answer_timestamp']:
+            if c in dr.columns:
+                dr[c] = pd.to_datetime(dr[c], errors='coerce')
+        # keep review text and score
+        dim_reviews = dr.drop_duplicates(subset=['review_id']).reset_index(drop=True)
+        print(f"  - Created dim_reviews with {len(dim_reviews)} review rows.")
+    else:
+        dim_reviews = pd.DataFrame(columns=['review_id','order_id','review_score','review_comment_message','review_creation_date'])
+        print("  - order_reviews not found; dim_reviews empty.")
+
+    # --- Create the Fact Table ---
+    # Start with order_items as base (transaction-level)
+    fact_orders = dataframes['order_items'].copy()
+    # Include product / price / freight / seller info already present
+    # Join with orders to get customer_id and order dates
+    orders_cols = ['order_id', 'customer_id', 'order_status',
+                   'order_purchase_timestamp', 'order_approved_at',
+                   'order_delivered_carrier_date', 'order_delivered_customer_date',
+                   'order_estimated_delivery_date']
+    orders = dataframes['orders'][orders_cols].copy()
     fact_orders = pd.merge(fact_orders, orders, on='order_id', how='left')
 
-    # Join with order_payments to get payment info
-    payments = dataframes['order_payments'].groupby('order_id').agg(
-        payment_sequential=('payment_sequential', 'max'),
-        payment_installments=('payment_installments', 'sum'),
-        payment_value=('payment_value', 'sum')
-    ).reset_index()
-    fact_orders = pd.merge(fact_orders, payments, on='order_id', how='left')
+    # --- Payments: create order-level aggregates but preserve primary payment type ---
+    # We'll compute per-order aggregates and pick a "primary" payment_type (first by payment_sequential)
+    if not dim_payments.empty:
+        # Order-level aggregates:
+        payments_grp = dim_payments.groupby('order_id').agg(
+            payment_value_sum=('payment_value', 'sum'),
+            payment_installments_max=('payment_installments', 'max'),
+            payment_methods_count=('payment_type', lambda s: s.nunique())
+        ).reset_index()
 
-    # Join with order_reviews to get review scores
-    reviews = dataframes['order_reviews'][['order_id', 'review_score']].groupby('order_id').agg(review_score=('review_score', 'mean')).reset_index()
-    fact_orders = pd.merge(fact_orders, reviews, on='order_id', how='left')
-    
-    print(f"  - Created fact_orders with {len(fact_orders)} line items.")
+        # Find primary payment type by the smallest payment_sequential per order (first payment event)
+        prim = dim_payments.sort_values(['order_id', 'payment_sequential']).drop_duplicates('order_id', keep='first')[['order_id','payment_type','payment_installments']].rename(
+            columns={'payment_type':'payment_type_primary','payment_installments':'payment_installments_primary'}
+        )
 
-    return {
+        payments_order = pd.merge(payments_grp, prim, on='order_id', how='left')
+        # Merge into fact_orders
+        fact_orders = pd.merge(fact_orders, payments_order, on='order_id', how='left')
+        print(f"  - Merged payment aggregates into fact_orders (orders with payments: {payments_order['order_id'].nunique()}).")
+    else:
+        # create empty columns for downstream expectations
+        fact_orders['payment_value_sum'] = np.nan
+        fact_orders['payment_installments_max'] = np.nan
+        fact_orders['payment_methods_count'] = 0
+        fact_orders['payment_type_primary'] = np.nan
+        fact_orders['payment_installments_primary'] = np.nan
+        print("  - No payments to merge into fact_orders.")
+
+    # --- Reviews: attach review-level aggregates and keep dim_reviews for detailed analysis
+    if not dim_reviews.empty:
+        # per-order review score mean (if multiple reviews per order)
+        reviews_grp = dim_reviews.groupby('order_id').agg(
+            review_score_mean=('review_score','mean'),
+            review_count=('review_id','nunique')
+        ).reset_index()
+        fact_orders = pd.merge(fact_orders, reviews_grp, on='order_id', how='left')
+        print(f"  - Merged review aggregates into fact_orders (orders with reviews: {reviews_grp['order_id'].nunique()}).")
+    else:
+        fact_orders['review_score_mean'] = np.nan
+        fact_orders['review_count'] = 0
+        print("  - No reviews found to merge.")
+
+    # --- Feature engineering on fact_orders (example features) ---
+    # delivery_time_days: purchase -> delivered to customer
+    fact_orders['order_purchase_timestamp'] = pd.to_datetime(fact_orders['order_purchase_timestamp'], errors='coerce')
+    fact_orders['order_delivered_customer_date'] = pd.to_datetime(fact_orders['order_delivered_customer_date'], errors='coerce')
+    fact_orders['delivery_time_days'] = (fact_orders['order_delivered_customer_date'] - fact_orders['order_purchase_timestamp']).dt.days
+    # is_late: delivered after estimated
+    fact_orders['order_estimated_delivery_date'] = pd.to_datetime(fact_orders['order_estimated_delivery_date'], errors='coerce')
+    fact_orders['is_late'] = (fact_orders['order_delivered_customer_date'] > fact_orders['order_estimated_delivery_date'])
+
+    # freight_ratio: if price exists
+    if 'price' in fact_orders.columns and 'freight_value' in fact_orders.columns:
+        fact_orders['freight_ratio'] = fact_orders['freight_value'] / fact_orders['price'].replace({0: np.nan})
+    else:
+        fact_orders['freight_ratio'] = np.nan
+
+    print(f"  - Created fact_orders with {len(fact_orders)} line items (after merges).")
+
+    # Final dictionary of schema tables (including the new dims)
+    schema = {
         "fact_orders": fact_orders,
         "dim_customers": dim_customers,
         "dim_products": dim_products,
-        "dim_sellers": dim_sellers
+        "dim_sellers": dim_sellers,
+        "dim_payments": dim_payments,   
+        "dim_reviews": dim_reviews      
     }
+
+    return schema
 
 def load_schema_tables(schema_tables):
     """Saves each table in the star schema as a separate Parquet file."""
