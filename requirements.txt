@@ -2,3 +2,4 @@ pandas
 jupyterlab
 pyarrow
 great_expectations==0.15.50
+duckdb
