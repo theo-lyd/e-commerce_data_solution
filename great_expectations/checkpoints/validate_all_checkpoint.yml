@@ -1,0 +1,47 @@
+name: validate_all_checkpoint
+config_version: 1.0
+module_name: great_expectations.checkpoint
+class_name: Checkpoint
+run_name_template: '%Y%m%d-%H%M%S-validation-run'
+action_list:
+  - name: store_validation_result
+    action:
+      class_name: StoreValidationResultAction
+  - name: store_evaluation_params
+    action:
+      class_name: StoreEvaluationParametersAction
+  #- name: update_data_docs
+    #action:
+      #class_name: UpdateDataDocsAction
+      #site_names: []
+validations:
+  - batch_request:
+      datasource_name: olist_datasource
+      data_connector_name: default_inferred_data_connector_name
+      data_asset_name: fact_orders
+    expectation_suite_name: fact_orders.warning
+  - batch_request:
+      datasource_name: olist_datasource
+      data_connector_name: default_inferred_data_connector_name
+      data_asset_name: dim_customers
+    expectation_suite_name: dim_customers.warning
+  - batch_request:
+      datasource_name: olist_datasource
+      data_connector_name: default_inferred_data_connector_name
+      data_asset_name: dim_products
+    expectation_suite_name: dim_products.warning
+  - batch_request:
+      datasource_name: olist_datasource
+      data_connector_name: default_inferred_data_connector_name
+      data_asset_name: dim_sellers
+    expectation_suite_name: dim_sellers.warning
+  - batch_request:
+      datasource_name: olist_datasource
+      data_connector_name: default_inferred_data_connector_name
+      data_asset_name: dim_reviews
+    expectation_suite_name: dim_reviews.warning
+  - batch_request:
+      datasource_name: olist_datasource
+      data_connector_name: default_inferred_data_connector_name
+      data_asset_name: dim_payments
+    expectation_suite_name: dim_payments.warning

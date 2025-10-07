@@ -60,15 +60,65 @@ def transform_and_create_schema(dataframes):
     dim_customers = dataframes['customers'].drop_duplicates(subset=['customer_id']).copy()
     print(f"  - Created dim_customers with {len(dim_customers)} unique customers.")
 
-    # 2. dim_products (include translated category)
+
+    # 2. dim_products (include translated category; handle nulls in product_category_name)
     products = dataframes['products'].copy()
-    translations = dataframes.get('product_category_name_translation', pd.DataFrame())
+
+    # Ensure the key column exists
+    if 'product_category_name' not in products.columns:
+        products['product_category_name'] = pd.NA
+
+    # Normalize category strings (trim whitespace; keep as string dtype)
+    products['product_category_name'] = products['product_category_name'].astype('string').str.strip()
+
+    # Prepare translations if present. We try to be flexible about the translation column name.
+    translations = dataframes.get('product_category_name_translation', pd.DataFrame()).copy()
+    trans_col_name = None
+    if not translations.empty:
+        # Expect translations to have the key column + one additional column with translated values.
+        key_col = 'product_category_name'
+        other_cols = [c for c in translations.columns if c != key_col]
+        if other_cols:
+            trans_col_name = other_cols[0]
+            # rename the translation column to a deterministic name we will use
+            translations = translations[[key_col, trans_col_name]].rename(columns={trans_col_name: 'product_category_name_translated'})
+        else:
+            # no useful translation column present; drop translations to avoid wrong merges
+            translations = pd.DataFrame()
+
+    # Merge translations (left join so every product row is preserved)
     if not translations.empty:
         dim_products = pd.merge(products, translations, on='product_category_name', how='left')
     else:
         dim_products = products.copy()
-    dim_products = dim_products.drop_duplicates(subset=['product_id'])
-    print(f"  - Created dim_products with {len(dim_products)} unique products.")
+        # create the translated column (all NaN) so downstream logic is uniform
+        dim_products['product_category_name_translated'] = pd.NA
+
+    # Create canonical category column:
+    # priority: translated value (if present and non-empty) -> original product_category_name -> fallback 'UNKNOWN'
+    # use .astype('string') to ensure consistent string-handling and preserve pandas string NA semantics
+    dim_products['product_category_name_translated'] = dim_products['product_category_name_translated'].astype('string')
+    dim_products['product_category_name'] = dim_products['product_category_name'].astype('string')
+
+    # Build the canonical final column
+    dim_products['product_category_name_final'] = dim_products['product_category_name_translated'].fillna(dim_products['product_category_name'])
+    dim_products['product_category_name_final'] = dim_products['product_category_name_final'].fillna('UNKNOWN').str.strip()
+
+    # Add a flag that the original value was missing (useful for audits / debugging)
+    dim_products['product_category_name_missing'] = dim_products['product_category_name'].isna()
+
+    # Replace the canonical value back into product_category_name (preserve original in *_original if needed)
+    dim_products['product_category_name_original'] = dim_products['product_category_name']
+    dim_products['product_category_name'] = dim_products['product_category_name_final']
+
+    # Optional: drop the helper column product_category_name_final (we kept original in *_original)
+    dim_products = dim_products.drop(columns=['product_category_name_final'])
+
+    # Report how many were filled (useful for logging)
+    filled_count = int(dim_products['product_category_name_missing'].sum())
+    # If missing is True it means original was null. We filled with either translated value or 'UNKNOWN'.
+    print(f"  - Created dim_products with {len(dim_products)} unique products. (filled {int(filled_count)} missing product_category_name -> 'UNKNOWN' or translated)")
+
 
     # 3. dim_sellers
     dim_sellers = dataframes['sellers'].drop_duplicates(subset=['seller_id']).copy()
